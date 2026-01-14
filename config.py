@@ -1,8 +1,8 @@
 CHECK_INTERVAL = 300  # seconds (5 minutes)
 
 TELEGRAM = {
-    "bot_token": "7823459094:AAGn3zXmXKJzBOqWUhmm4ye1sg4N2wPawY8",
-    "chat_id": 8599255772,
+    "bot_token": "<TOKEN>",
+    "chat_id": <CHAT_ID>,
 }
 
 DB_FILE = "monitor.db"
