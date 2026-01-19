@@ -1,12 +1,13 @@
 # Dynamic web status + caster management page for NTRIP monitor
-# Lightweight Flask app suitable for Raspberry Pi 1
-# Provides status view AND add/edit/delete NTRIP casters
+# Refactored to match symmetric alerting logic in monitor.py
+# Suitable for Raspberry Pi 1
 
 from flask import Flask, request, redirect, url_for, render_template_string
 import sqlite3
 from datetime import datetime
 
 DB_FILE = "monitor.db"
+ALERT_THRESHOLD = 2  # MUST match monitor.py
 
 app = Flask(__name__)
 
@@ -24,6 +25,7 @@ HTML_TEMPLATE = """
         th { background:#333; color:#fff; }
         .ok { background:#c8e6c9; }
         .fail { background:#ffcdd2; }
+        .unstable { background:#fff3cd; }
         .formbox { width: 90%; margin: auto; background:#fff; padding:15px; }
         input { padding:6px; margin:4px; }
         .btn { padding:6px 10px; }
@@ -37,11 +39,16 @@ HTML_TEMPLATE = """
 
 <h2>Current Status</h2>
 <table>
-<tr><th>Caster</th><th>Status</th><th>Last Message</th><th>Last Check</th></tr>
+<tr>
+    <th>Caster</th>
+    <th>Status</th>
+    <th>Last Message</th>
+    <th>Last Check</th>
+</tr>
 {% for row in status_rows %}
-<tr class="{{ 'ok' if row['success'] else 'fail' }}">
+<tr class="{{ row['css'] }}">
 <td>{{ row['caster'] }}</td>
-<td>{{ 'UP' if row['success'] else 'DOWN' }}</td>
+<td>{{ row['status'] }}</td>
 <td>{{ row['message'] }}</td>
 <td>{{ row['timestamp'] }}</td>
 </tr>
@@ -71,8 +78,9 @@ Pass <input name="password" required>
 <td><input name="port" value="{{ c['port'] }}" size="5"></td>
 <td><input name="username" value="{{ c['username'] }}"></td>
 <td><input name="password" value="{{ c['password'] }}"></td>
-<td><button class="btn" type="submit">Save</button>
-<a href="/delete/{{ c['id'] }}" class="btn danger">Delete</a>
+<td>
+    <button class="btn" type="submit">Save</button>
+    <a href="/delete/{{ c['id'] }}" class="btn danger">Delete</a>
 </td>
 </form>
 </tr>
@@ -83,6 +91,9 @@ Pass <input name="password" required>
 </html>
 """
 
+# -----------------------------
+# DB helpers
+# -----------------------------
 
 def db():
     conn = sqlite3.connect(DB_FILE)
@@ -109,29 +120,6 @@ def ensure_tables():
     conn.close()
 
 
-def get_latest_status():
-    conn = db()
-    c = conn.cursor()
-
-    c.execute("""
-        SELECT c1.caster, c1.success, c1.message, c1.timestamp
-        FROM checks c1
-        JOIN (
-            SELECT caster, MAX(id) AS max_id
-            FROM checks
-            GROUP BY caster
-        ) c2
-	        ON c1.caster = c2.caster AND c1.id = c2.max_id
-	JOIN casters c3
-		ON c1.caster = c3.name
-        ORDER BY c1.caster
-    """)
-
-    rows = c.fetchall()
-    conn.close()
-    return rows
-
-
 def get_casters():
     conn = db()
     c = conn.cursor()
@@ -141,12 +129,64 @@ def get_casters():
     return rows
 
 
+def get_status_rows():
+    conn = db()
+    c = conn.cursor()
+
+    status_rows = []
+
+    for caster in get_casters():
+        c.execute("""
+            SELECT success, message, timestamp
+            FROM checks
+            WHERE caster = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (caster["name"], ALERT_THRESHOLD))
+
+        rows = c.fetchall()
+
+        if not rows:
+            status = "UNKNOWN"
+            css = "unstable"
+            message = ""
+            timestamp = ""
+        else:
+            successes = [r["success"] for r in rows]
+            message = rows[0]["message"]
+            timestamp = rows[0]["timestamp"]
+
+            if successes == [1] * ALERT_THRESHOLD:
+                status = "UP"
+                css = "ok"
+            elif successes == [0] * ALERT_THRESHOLD:
+                status = "DOWN"
+                css = "fail"
+            else:
+                status = "UNSTABLE"
+                css = "unstable"
+
+        status_rows.append({
+            "caster": caster["name"],
+            "status": status,
+            "css": css,
+            "message": message,
+            "timestamp": timestamp
+        })
+
+    conn.close()
+    return status_rows
+
+# -----------------------------
+# Routes
+# -----------------------------
+
 @app.route("/")
 def index():
     ensure_tables()
     return render_template_string(
         HTML_TEMPLATE,
-        status_rows=get_latest_status(),
+        status_rows=get_status_rows(),
         casters=get_casters(),
         now=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     )
@@ -171,18 +211,11 @@ def edit(id):
     conn = db()
     c = conn.cursor()
 
-    if request.form.get("password"):
-        c.execute(
-            "UPDATE casters SET name=?, host=?, port=?, username=?, password=? WHERE id=?",
-            (request.form["name"], request.form["host"], int(request.form["port"]),
-             request.form["username"], request.form["password"], id)
-        )
-    else:
-        c.execute(
-            "UPDATE casters SET name=?, host=?, port=?, username=? WHERE id=?",
-            (request.form["name"], request.form["host"], int(request.form["port"]),
-             request.form["username"], id)
-        )
+    c.execute(
+        "UPDATE casters SET name=?, host=?, port=?, username=?, password=? WHERE id=?",
+        (request.form["name"], request.form["host"], int(request.form["port"]),
+         request.form["username"], request.form["password"], id)
+    )
 
     conn.commit()
     conn.close()
