@@ -10,6 +10,11 @@ import urllib.parse
 from config import CHECK_INTERVAL, TELEGRAM, DB_FILE, CSV_PREFIX
 
 TIMEOUT = 10
+ALERT_THRESHOLD = 2  # N consecutive up/down required
+
+# -----------------------------
+# Database helpers
+# -----------------------------
 
 def load_casters():
     conn = sqlite3.connect(DB_FILE)
@@ -19,35 +24,6 @@ def load_casters():
     rows = c.fetchall()
     conn.close()
     return rows
-
-
-def telegram_alert(text):
-    url = "https://api.telegram.org/bot{}/sendMessage".format(
-        TELEGRAM["bot_token"]
-    )
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM["chat_id"],
-        "text": text
-    }).encode("utf-8")
-
-    req = urllib.request.Request(url, data=data)
-    urllib.request.urlopen(req, timeout=10)
-
-
-def get_csv_filename():
-    date_str = time.strftime("%Y-%m-%d")
-    return "{}-{}.csv".format(CSV_PREFIX, date_str)
-
-
-def write_csv_row(row):
-    filename = get_csv_filename()
-    file_exists = os.path.isfile(filename)
-
-    with open(filename, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["timestamp", "caster", "success", "message"])
-        writer.writerow(row)
 
 
 def log_result(caster, success, message):
@@ -68,14 +44,76 @@ def log_result(caster, success, message):
     ])
 
 
+def last_n_results(caster, n):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT success FROM checks
+        WHERE caster = ?
+        ORDER BY id DESC
+        LIMIT ?
+    """, (caster, n))
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+# -----------------------------
+# CSV logging
+# -----------------------------
+
+def get_csv_filename():
+    date_str = time.strftime("%Y-%m-%d")
+    return "{}-{}.csv".format(CSV_PREFIX, date_str)
+
+
+def write_csv_row(row):
+    filename = get_csv_filename()
+    file_exists = os.path.isfile(filename)
+
+    with open(filename, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["timestamp", "caster", "success", "message"])
+        writer.writerow(row)
+
+# -----------------------------
+# Telegram alerting (hardened)
+# -----------------------------
+
+def telegram_alert(text):
+    try:
+        url = "https://api.telegram.org/bot{}/sendMessage".format(
+            TELEGRAM["bot_token"]
+        )
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM["chat_id"],
+            "text": text
+        }).encode("utf-8")
+
+        req = urllib.request.Request(url, data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        # Never allow alerting failures to kill the monitor
+        pass
+
+# -----------------------------
+# NTRIP check (hardened)
+# -----------------------------
+
 def check_ntrip(caster):
     auth = "{}:{}".format(caster["username"], caster["password"])
     auth_b64 = base64.b64encode(auth.encode()).decode()
 
     request = (
-        "GET / HTTP/1.0\r\n"
+        "GET / HTTP/1.1\r\n"
+        "Host: {host}\r\n"
         "User-Agent: NTRIP PythonMonitor\r\n"
-        "Authorization: Basic {}\r\n\r\n".format(auth_b64)
+        "Authorization: Basic {auth}\r\n"
+        "Accept: */*\r\n"
+        "Connection: close\r\n\r\n"
+    ).format(
+        host=caster["host"],
+        auth=auth_b64
     )
 
     try:
@@ -86,47 +124,50 @@ def check_ntrip(caster):
             s.sendall(request.encode())
             response = s.recv(4096).decode(errors="ignore")
 
-        if "SOURCETABLE" in response:
-            return True, "Sourcetable received"
-        else:
-            return False, "No sourcetable in response"
+        if (
+            "SOURCETABLE" in response
+            or "200 OK" in response
+            or response.startswith("ICY 200")
+        ):
+            return True, "Caster responded OK"
+
+        return False, "Unexpected response"
 
     except Exception as e:
         return False, str(e)
 
-
-def last_two_results(caster):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        SELECT success FROM checks
-        WHERE caster = ?
-        ORDER BY id DESC
-        LIMIT 2
-    """, (caster,))
-    rows = c.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
+# -----------------------------
+# Main loop
+# -----------------------------
 
 def main():
     while True:
         for caster in load_casters():
-            success, message = check_ntrip(caster)
-            log_result(caster["name"], success, message)
+            try:
+                success, message = check_ntrip(caster)
+                log_result(caster["name"], success, message)
 
-            history = last_two_results(caster["name"])
+                history = last_n_results(caster["name"], ALERT_THRESHOLD)
 
-            if history == [0, 0]:
-                telegram_alert(
-                    "🚨 NTRIP DOWN\n{}\n{}".format(
-                        caster["name"], message
+                if history == [0] * ALERT_THRESHOLD:
+                    telegram_alert(
+                        "🚨 NTRIP DOWN\n{}\n{}".format(
+                            caster["name"], message
+                        )
                     )
-                )
 
-            if history == [1, 0]:
+                elif history == [1] * ALERT_THRESHOLD:
+                    telegram_alert(
+                        "✅ NTRIP RECOVERED\n{}".format(
+                            caster["name"]
+                        )
+                    )
+
+            except Exception as e:
+                # Catch-all to ensure one bad caster never kills the loop
                 telegram_alert(
-                    "✅ NTRIP RECOVERED\n{}".format(
-                        caster["name"]
+                    "⚠️ Monitor error\n{}\n{}".format(
+                        caster["name"], e
                     )
                 )
 
